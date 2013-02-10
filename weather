@@ -1,0 +1,276 @@
+#!/usr/bin/env ruby
+require 'gli'
+require 'active_record'
+#require 'watir'
+
+include GLI::App
+
+program_desc 'A tool for harvesting weather data for use in rain garden and rain barrel simulation.'
+
+desc 'Database configuration YAML file'
+default_value 'database.yml'
+arg_name 'Filename'
+flag [:d,:dbconfigfile]
+
+# COMMAND: Reap
+desc 'Harvest the data!'
+command :reap do |c|
+
+	c.desc 'Seed URL'
+	c.arg_name 'URL'
+	c.default_value 'http://www1.ncdc.noaa.gov/pub/data/uscrn/products/hourly02/'
+	c.flag [:u,:url]
+
+	c.desc 'Desired start year'
+	c.arg_name 'YYYY'
+	c.flag [:b,:begin]
+
+	c.desc 'Desired stop year'
+	c.arg_name 'YYYY'
+	c.flag [:e,:end]
+
+	c.desc 'Station name'
+	c.arg_name 'SS_City_D_Dir'
+	c.flag [:s,:station]
+
+	c.action do |global_options,options,args|
+		require 'mechanize'
+		require 'open-uri'
+
+    # Build the hourly database
+		puts "REAPING: Years #{options[:begin]} to #{options[:end]} for station #{options[:station]}"
+    printf("  Pulling down hourly data...")
+    agent = Mechanize.new
+
+		(options[:begin].to_i..options[:end].to_i).each do |year|
+			url = options[:url] + year.to_s + "/CRNH0203-#{year.to_s}-#{options[:station]}.txt"
+			page = agent.get(url)
+
+			records = 0
+
+			page.body.each_line do |line|
+				values = line.unpack('A6A9A5A9A5A7A8A8A8A8A8A8A8A7A2A7A2A7A2A7A2A2A8A2A8A2A8A2A6A2A8A8A8A8A8A8A8A8A8A8Z*')
+				weather = HourlyWeather.new do |w|
+					w.url = url
+					w.wbanno = values[0].to_i
+					w.lst_date = values[3].to_i
+					w.lst_time = values[4].to_i
+					w.date = DateTime.strptime(values[3] + values[4], '%Y%m%d%H%M')
+					w.long = values[6].to_f
+					w.lat = values[7].to_f
+					w.t = values[9].to_f
+					w.t_flag = w.t < -200 ? 3 : 0
+					w.t_min = values[11].to_f
+					w.t_max = values[10].to_f
+					w.p = values[12].to_f
+					w.p_flag = w.p < 0 ? 3 : 0
+					w.rad = values[13].to_f
+					w.rad_flag = values[14].to_i
+					w.rh = values[26].to_f
+					w.rh_flag = values[27].to_i
+				end
+				weather.save
+
+				records = records + 1
+				printf("\r  Pulling down hourly data for #{year}... #{(records*100)/(365*24)}%")
+			end
+			printf("\n")
+		end
+	end
+end
+
+# COMMAND: Average
+desc 'Generate daily averages for the collected hourly data'
+command :average do |c|
+	c.action do |global_options,options,args|
+		# Figure out the existing date range
+		begin_date = HourlyWeather.first.date
+		end_date = HourlyWeather.last.date
+
+		# Build the daily average database	
+		printf("  Creating daily averages...")
+		records = 0
+
+		begin_date.to_date.upto(end_date.to_date) do |day|
+			data_for_day = HourlyWeather.all(:conditions => {:date => day..(day+1), :rad_flag => 0, :t_flag => 0, :p_flag => 0})
+
+			weather = DailyWeather.new do |w|
+				w.url = data_for_day.first.url
+				w.wbanno = data_for_day.first.wbanno
+				w.lst_date = data_for_day.first.lst_date
+				w.date = day
+				w.long = data_for_day.first.long
+				w.lat = data_for_day.first.lat
+				w.hours_included = data_for_day.count
+
+				t_sum = 0.0
+				p_sum = 0.0
+				rad_sum = 0.0
+				rh_sum = 0.0
+				w.t_max = data_for_day.first.t
+				w.t_min = data_for_day.first.t
+				w.rad_max = data_for_day.first.rad
+				w.rad_min = data_for_day.first.rad
+
+				data_for_day.each do |data|
+					t_sum = t_sum + data.t
+					p_sum = p_sum + data.p
+					rad_sum = rad_sum + data.rad
+					rh_sum = rh_sum + data.rh
+					w.t_max = data.t if data.t > w.t_max
+					w.t_min = data.t if data.t < w.t_min
+					w.rad_max = data.rad if data.rad > w.rad_max
+					w.rad_min = data.rad if data.rad < w.rad_min
+				end
+				w.t = t_sum/data_for_day.count
+				w.p = p_sum
+				w.rad = rad_sum/data_for_day.count
+				w.rh = rh_sum/data_for_day.count
+			end
+			weather.save
+
+			records = records + 1
+			printf("\r  Creating daily averages... #{(records*100)/(end_date.to_date-begin_date.to_date).to_i}%")
+		end
+		printf("\n")
+	end
+end
+
+# COMMAND: Csv
+desc 'Write the database to CSV'
+command :csv do |c|
+	c.desc 'Destination CSV file'
+	c.default_value 'daily_weather.csv'
+	c.arg_name 'Filename'
+	c.flag [:c,:csvfile]
+
+	c.action do |global_options,options,args|
+		require 'csv'
+
+		puts "CSV: Writing comma seperated values to #{options[:csvfile]}"
+		printf("  Writing daily average data...")
+		CSV.open(options[:csvfile], 'wb') do |csv|
+			csv << ['created', 'url', 'wbanno', 'lst_date', 'date', 'lon', 'lat', 'temp', 'max_temp', 'min_temp', 'precip', 'rad', 'max_rad', 'min_rad', 'rh', 'hours_included']
+
+			records = DailyWeather.all.count
+			DailyWeather.all.each_with_index do |w,i|
+				csv << [w.created_at, w.url, w.wbanno, w.lst_date, w.date.strftime('%m-%d-%Y'), w.long, w.lat, w.t.round(1), w.t_max.round(1), w.t_min.round(1), w.p.round(1), w.rad.round(0), w.rad_max, w.rad_min, w.rh.round(0), w.hours_included]
+				printf("\r  Writing daily average data... #{i*100/records}%")
+			end
+			printf("\r  Writing daily average data... Finished\n")
+		end
+	end
+end
+
+# COMMAND: Destroy
+desc 'Destroy the current database'
+command :destroy do |c|
+	c.desc 'Destroy only the daily averages table'
+	c.switch [:daily]
+
+	c.desc 'Destroy only the hourly data table'
+	c.switch [:hourly]
+
+	c.action do |global_options,options,args|
+		if options[:daily]
+			puts "DESTROYING: Dropping the daily averages table"
+			ActiveRecord::Migration.drop_table(:daily_weathers)
+		elsif options[:hourly]
+			puts "DESTROYING: Dropping the hourly data table"
+			ActiveRecord::Migration.drop_table(:hourly_weathers)
+		else
+			puts "DESTROYING: Removing database file for #{ActiveRecord::Base.connection_config[:database]}"
+			require 'pathname'
+			require 'fileutils'
+
+			path = Pathname.new(ActiveRecord::Base.connection_config[:database])
+			file = path.absolute? ? path.to_s : File.join(File.dirname(__FILE__), path)
+			FileUtils.rm(file)
+		end
+	end
+end
+
+pre do |global_options,command,options,args|
+	puts "STARTING"
+	#Check to see if the database config exists
+	unless File.exist?(global_options[:dbconfigfile])
+		File.open(global_options[:dbconfigfile], 'w') do |f|
+			f.write("adapter: sqlite3\ndatabase: weather-db")
+		end
+		puts "  Database config file not found. Wrote default config to #{global_options[:dbconfigfile]}"
+	end
+
+	#Connect to the database
+	ActiveRecord::Base.establish_connection(YAML::load(File.open(global_options[:dbconfigfile])))
+
+	unless ActiveRecord::Base.connection.table_exists? :hourly_weathers 
+		puts "  Failed to find the hourly weather table in the database"
+		ActiveRecord::Schema.define do
+			create_table :hourly_weathers do |t|
+				t.column :url, :string         # URL of the source page
+				t.column :wbanno, :integer     # WBAN number of the station
+				t.column :lst_date, :integer
+				t.column :lst_time, :integer
+				t.column :date, :datetime
+				t.column :long, :float         # Station longitude/latitude
+				t.column :lat, :float
+				t.column :t, :float            # Average temp for the last hour
+				t.column :t_max, :float				 # Max temp for the last hour
+				t.column :t_min, :float        # Min temp for the last hour
+				t.column :t_flag, :integer
+				t.column :p, :float       # Precipitaton for the last hour
+				t.column :p_flag, :integer
+				t.column :rad, :float          # Average solar radiation for the last hour
+				t.column :rad_flag, :integer   # Solar radiation flag (3 is bad)
+				t.column :rh, :float           # Average relative humidity
+				t.column :rh_flag, :integer    # 3 is bad
+				t.timestamps
+			end
+		end
+	end
+
+	unless ActiveRecord::Base.connection.table_exists? :daily_weathers 
+		puts "  Failed to find the daily weather table in the database"
+		ActiveRecord::Schema.define do
+			create_table :daily_weathers do |t|
+				t.column :url, :string         # URL of the source page
+				t.column :wbanno, :integer     # WBAN number of the station
+				t.column :lst_date, :integer
+				t.column :date, :datetime
+				t.column :long, :float         # Station longitude/latitude
+				t.column :lat, :float
+				t.column :t, :float            # Average temp for the last hour
+				t.column :t_max, :float				 # Max temp for the last hour
+				t.column :t_min, :float        # Min temp for the last hour
+				t.column :p, :float       # Precipitaton for the last hour
+				t.column :rad, :float          # Average solar radiation for the last hour
+				t.column :rad_max, :float
+				t.column :rad_min, :float
+				t.column :rh, :float           # Average relative humidity
+				t.column :hours_included, :integer
+				t.timestamps
+			end
+		end
+	end
+
+	class HourlyWeather < ActiveRecord::Base
+		attr_accessible :url, :wbanno, :lst_date, :lst_time, :date,  :long, :lat, :t, :t_max, :t_min, :p, :rad, :rad_flag, :rad_max, :rad_max_flag, :rad_min, :rad_min_flag, :rh, :rh_flag
+	end
+
+	class DailyWeather < ActiveRecord::Base
+		attr_accessible :url, :wbanno, :lst_date, :lst_time, :date,  :long, :lat, :t, :t_max, :t_min, :p, :rad, :rad_flag, :rad_max, :rad_max_flag, :rad_min, :rad_min_flag, :rh, :rh_flag
+	end
+	true
+end
+
+post do |global_options,command,options,args|
+  puts 'DONE'
+end
+
+on_error do |exception|
+  # Error logic here
+  # return false to skip default error handling
+  true
+end
+
+exit run(ARGV)
